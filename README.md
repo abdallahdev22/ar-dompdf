@@ -88,7 +88,7 @@ To install with [Composer](https://getcomposer.org/), simply require the
 latest version of this package.
 
 ```bash
-composer require dompdf/dompdf
+composer require kgcoder/ar-dompdf
 ```
 
 Make sure that the autoload file from Composer is loaded.
