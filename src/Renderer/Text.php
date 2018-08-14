@@ -1,166 +1,266 @@
-<?php
-/**
- * @package dompdf
- * @link    http://dompdf.github.com/
- * @author  Benj Carson <benjcarson@digitaljunkies.ca>
- * @author  Helmut Tischer <htischer@weihenstephan.org>
- * @author  Fabien Ménager <fabien.menager@gmail.com>
- * @license http://www.gnu.org/copyleft/lesser.html GNU Lesser General Public License
- */
-namespace Dompdf\Renderer;
+<?php namespace BookStack\Services;
 
-use Dompdf\Adapter\CPDF;
-use Dompdf\Frame;
+use BookStack\Book;
+use BookStack\Chapter;
+use BookStack\Page;
+use BookStack\Repos\EntityRepo;
 
-/**
- * Renders text frames
- *
- * @package dompdf
- */
-class Text extends AbstractRenderer
+class ExportService
 {
-    /** Thickness of underline. Screen: 0.08, print: better less, e.g. 0.04 */
-    const DECO_THICKNESS = 0.02;
 
-    //Tweaking if $base and $descent are not accurate.
-    //Check method_exists( $this->_canvas, "get_cpdf" )
-    //- For cpdf these can and must stay 0, because font metrics are used directly.
-    //- For other renderers, if different values are wanted, separate the parameter sets.
-    //  But $size and $size-$height seem to be accurate enough
-
-    /** Relative to bottom of text, as fraction of height */
-    const UNDERLINE_OFFSET = 0.0;
-
-    /** Relative to top of text */
-    const OVERLINE_OFFSET = 0.0;
-
-    /** Relative to centre of text. */
-    const LINETHROUGH_OFFSET = 0.0;
-
-    /** How far to extend lines past either end, in pt */
-    const DECO_EXTENSION = 0.0;
+    protected $entityRepo;
 
     /**
-     * @param \Dompdf\FrameDecorator\Text $frame
+     * ExportService constructor.
+     * @param $entityRepo
      */
-    function render(Frame $frame)
+    public function __construct(EntityRepo $entityRepo)
     {
-        $text = $frame->get_text();
-        if (trim($text) === "") {
-            return;
+        $this->entityRepo = $entityRepo;
+    }
+
+    /**
+     * Convert a page to a self-contained HTML file.
+     * Includes required CSS & image content. Images are base64 encoded into the HTML.
+     * @param Page $page
+     * @return mixed|string
+     */
+    public function pageToContainedHtml(Page $page)
+    {
+        $this->entityRepo->renderPage($page);
+        $pageHtml = view('pages/export', [
+            'page' => $page
+        ])->render();
+        return $this->containHtml($pageHtml);
+    }
+
+    /**
+     * Convert a chapter to a self-contained HTML file.
+     * @param Chapter $chapter
+     * @return mixed|string
+     */
+    public function chapterToContainedHtml(Chapter $chapter)
+    {
+        $pages = $this->entityRepo->getChapterChildren($chapter);
+        $pages->each(function ($page) {
+            $page->html = $this->entityRepo->renderPage($page);
+        });
+        $html = view('chapters/export', [
+            'chapter' => $chapter,
+            'pages' => $pages
+        ])->render();
+        return $this->containHtml($html);
+    }
+
+    /**
+     * Convert a book to a self-contained HTML file.
+     * @param Book $book
+     * @return mixed|string
+     */
+    public function bookToContainedHtml(Book $book)
+    {
+        $bookTree = $this->entityRepo->getBookChildren($book, true, true);
+        $html = view('books/export', [
+            'book' => $book,
+            'bookChildren' => $bookTree
+        ])->render();
+        return $this->containHtml($html);
+    }
+
+    /**
+     * Convert a page to a PDF file.
+     * @param Page $page
+     * @return mixed|string
+     */
+    public function pageToPdf(Page $page)
+    {
+        $this->entityRepo->renderPage($page);
+        $html = view('pages/pdf', [
+            'page' => $page
+        ])->render();
+        return $this->htmlToPdf($html);
+    }
+
+    /**
+     * Convert a chapter to a PDF file.
+     * @param Chapter $chapter
+     * @return mixed|string
+     */
+    public function chapterToPdf(Chapter $chapter)
+    {
+        $pages = $this->entityRepo->getChapterChildren($chapter);
+        $pages->each(function ($page) {
+            $page->html = $this->entityRepo->renderPage($page);
+        });
+        $html = view('chapters/export', [
+            'chapter' => $chapter,
+            'pages' => $pages
+        ])->render();
+        return $this->htmlToPdf($html);
+    }
+
+    /**
+     * Convert a book to a PDF file
+     * @param Book $book
+     * @return string
+     */
+    public function bookToPdf(Book $book)
+    {
+        $bookTree = $this->entityRepo->getBookChildren($book, true, true);
+        $html = view('books/export', [
+            'book' => $book,
+            'bookChildren' => $bookTree
+        ])->render();
+        return $this->htmlToPdf($html);
+    }
+
+    /**
+     * Convert normal webpage HTML to a PDF.
+     * @param $html
+     * @return string
+     */
+    protected function htmlToPdf($html)
+    {
+        $containedHtml = $this->containHtml($html);
+        $useWKHTML = config('snappy.pdf.binary') !== false;
+        if ($useWKHTML) {
+            $pdf = \SnappyPDF::loadHTML($containedHtml);
+            $pdf->setOption('print-media-type', true);
+        } else {
+            $pdf = \DomPDF::loadHTML($containedHtml);
         }
+        return $pdf->output();
+    }
 
-        $style = $frame->get_style();
-        list($x, $y) = $frame->get_position();
-        $cb = $frame->get_containing_block();
+    /**
+     * Bundle of the contents of a html file to be self-contained.
+     * @param $htmlContent
+     * @return mixed|string
+     * @throws \Exception
+     */
+    protected function containHtml($htmlContent)
+    {
+        $imageTagsOutput = [];
+        preg_match_all("/\<img.*src\=(\'|\")(.*?)(\'|\").*?\>/i", $htmlContent, $imageTagsOutput);
 
-        if (($ml = $style->margin_left) === "auto" || $ml === "none") {
-            $ml = 0;
-        }
+        // Replace image src with base64 encoded image strings
+        if (isset($imageTagsOutput[0]) && count($imageTagsOutput[0]) > 0) {
+            foreach ($imageTagsOutput[0] as $index => $imgMatch) {
+                $oldImgString = $imgMatch;
+                $srcString = $imageTagsOutput[2][$index];
+                $isLocal = strpos(trim($srcString), 'http') !== 0;
+                if ($isLocal) {
+                    $pathString = public_path(trim($srcString, '/'));
+                } else {
+                    $pathString = $srcString;
+                }
 
-        if (($pl = $style->padding_left) === "auto" || $pl === "none") {
-            $pl = 0;
-        }
+                // Attempt to find local files even if url not absolute
+                $base = baseUrl('/');
+                if (strpos($srcString, $base) === 0) {
+                    $isLocal = true;
+                    $relString = str_replace($base, '', $srcString);
+                    $pathString = public_path(trim($relString, '/'));
+                }
 
-        if (($bl = $style->border_left_width) === "auto" || $bl === "none") {
-            $bl = 0;
-        }
-
-        $x += (float)$style->length_in_pt(array($ml, $pl, $bl), $cb["w"]);
-
-        $font = $style->font_family;
-        $size = $frame_font_size = $style->font_size;
-        $word_spacing = $frame->get_text_spacing() + (float)$style->length_in_pt($style->word_spacing);
-        $char_spacing = (float)$style->length_in_pt($style->letter_spacing);
-        $width = $style->width;
-
-        /*$text = str_replace(
-          array("{PAGE_NUM}"),
-          array($this->_canvas->get_page_number()),
-          $text
-        );*/
-
-        $this->_canvas->text($x, $y, $text,
-            $font, $size,
-            $style->color, $word_spacing, $char_spacing);
-
-        $line = $frame->get_containing_line();
-
-        // FIXME Instead of using the tallest frame to position,
-        // the decoration, the text should be well placed
-        if (false && $line->tallest_frame) {
-            $base_frame = $line->tallest_frame;
-            $style = $base_frame->get_style();
-            $size = $style->font_size;
-        }
-
-        $line_thickness = $size * self::DECO_THICKNESS;
-        $underline_offset = $size * self::UNDERLINE_OFFSET;
-        $overline_offset = $size * self::OVERLINE_OFFSET;
-        $linethrough_offset = $size * self::LINETHROUGH_OFFSET;
-        $underline_position = -0.08;
-
-        if ($this->_canvas instanceof CPDF) {
-            $cpdf_font = $this->_canvas->get_cpdf()->fonts[$style->font_family];
-
-            if (isset($cpdf_font["UnderlinePosition"])) {
-                $underline_position = $cpdf_font["UnderlinePosition"] / 1000;
-            }
-
-            if (isset($cpdf_font["UnderlineThickness"])) {
-                $line_thickness = $size * ($cpdf_font["UnderlineThickness"] / 1000);
-            }
-        }
-
-        $descent = $size * $underline_position;
-        $base = $size;
-
-        // Handle text decoration:
-        // http://www.w3.org/TR/CSS21/text.html#propdef-text-decoration
-
-        // Draw all applicable text-decorations.  Start with the root and work our way down.
-        $p = $frame;
-        $stack = array();
-        while ($p = $p->get_parent()) {
-            $stack[] = $p;
-        }
-
-        while (isset($stack[0])) {
-            $f = array_pop($stack);
-
-            if (($text_deco = $f->get_style()->text_decoration) === "none") {
-                continue;
-            }
-
-            $deco_y = $y; //$line->y;
-            $color = $f->get_style()->color;
-
-            switch ($text_deco) {
-                default:
+                if ($isLocal && !file_exists($pathString)) {
                     continue;
-
-                case "underline":
-                    $deco_y += $base - $descent + $underline_offset + $line_thickness / 2;
-                    break;
-
-                case "overline":
-                    $deco_y += $overline_offset + $line_thickness / 2;
-                    break;
-
-                case "line-through":
-                    $deco_y += $base * 0.7 + $linethrough_offset;
-                    break;
+                }
+                try {
+                    if ($isLocal) {
+                        $imageContent = file_get_contents($pathString);
+                    } else {
+                        $ch = curl_init();
+                        curl_setopt_array($ch, [CURLOPT_URL => $pathString, CURLOPT_RETURNTRANSFER => 1, CURLOPT_CONNECTTIMEOUT => 5]);
+                        $imageContent = curl_exec($ch);
+                        $err = curl_error($ch);
+                        curl_close($ch);
+                        if ($err) {
+                            throw new \Exception("Image fetch failed, Received error: " . $err);
+                        }
+                    }
+                    $imageEncoded = 'data:image/' . pathinfo($pathString, PATHINFO_EXTENSION) . ';base64,' . base64_encode($imageContent);
+                    $newImageString = str_replace($srcString, $imageEncoded, $oldImgString);
+                } catch (\ErrorException $e) {
+                    $newImageString = '';
+                }
+                $htmlContent = str_replace($oldImgString, $newImageString, $htmlContent);
             }
-
-            $dx = 0;
-            $x1 = $x - self::DECO_EXTENSION;
-            $x2 = $x + $width + $dx + self::DECO_EXTENSION;
-            $this->_canvas->line($x1, $deco_y, $x2, $deco_y, $color, $line_thickness);
         }
 
-        if ($this->_dompdf->getOptions()->getDebugLayout() && $this->_dompdf->getOptions()->getDebugLayoutLines()) {
-            $text_width = $this->_dompdf->getFontMetrics()->getTextWidth($text, $font, $frame_font_size);
-            $this->_debug_layout(array($x, $y, $text_width + ($line->wc - 1) * $word_spacing, $frame_font_size), "orange", array(0.5, 0.5));
+        $linksOutput = [];
+        preg_match_all("/\<a.*href\=(\'|\")(.*?)(\'|\").*?\>/i", $htmlContent, $linksOutput);
+
+        // Replace image src with base64 encoded image strings
+        if (isset($linksOutput[0]) && count($linksOutput[0]) > 0) {
+            foreach ($linksOutput[0] as $index => $linkMatch) {
+                $oldLinkString = $linkMatch;
+                $srcString = $linksOutput[2][$index];
+                if (strpos(trim($srcString), 'http') !== 0) {
+                    $newSrcString = url($srcString);
+                    $newLinkString = str_replace($srcString, $newSrcString, $oldLinkString);
+                    $htmlContent = str_replace($oldLinkString, $newLinkString, $htmlContent);
+                }
+            }
         }
+
+        // Replace any relative links with system domain
+        return (new Page)->getSecretHtmlAttribute($htmlContent);
+    }
+
+    /**
+     * Converts the page contents into simple plain text.
+     * This method filters any bad looking content to provide a nice final output.
+     * @param Page $page
+     * @return mixed
+     */
+    public function pageToPlainText(Page $page)
+    {
+        $html = $this->entityRepo->renderPage($page);
+        $text = (new Page)->getSecretHtmlAttribute($html);
+        $text = strip_tags($text);
+
+        // Replace multiple spaces with single spaces
+        $text = preg_replace('/\ {2,}/', ' ', $text);
+        // Reduce multiple horrid whitespace characters.
+        $text = preg_replace('/(\x0A|\xA0|\x0A|\r|\n){2,}/su', "\n\n", $text);
+        $text = html_entity_decode($text);
+        // Add title
+        $text = $page->name . "\n\n" . $text;
+        return $text;
+    }
+
+    /**
+     * Convert a chapter into a plain text string.
+     * @param Chapter $chapter
+     * @return string
+     */
+    public function chapterToPlainText(Chapter $chapter)
+    {
+        $text = $chapter->name . "\n\n";
+        $text .= $chapter->description . "\n\n";
+        foreach ($chapter->pages as $page) {
+            $text .= $this->pageToPlainText($page);
+        }
+        return $text;
+    }
+
+    /**
+     * Convert a book into a plain text string.
+     * @param Book $book
+     * @return string
+     */
+    public function bookToPlainText(Book $book)
+    {
+        $bookTree = $this->entityRepo->getBookChildren($book, true, true);
+        $text = $book->name . "\n\n";
+        foreach ($bookTree as $bookChild) {
+            if ($bookChild->isA('chapter')) {
+                $text .= $this->chapterToPlainText($bookChild);
+            } else {
+                $text .= $this->pageToPlainText($bookChild);
+            }
+        }
+        return $text;
     }
 }
